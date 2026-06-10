@@ -73,14 +73,24 @@ class QwenSFTTrainer(Trainer):
         # It keeps Liger Kernel fully active since we pass labels, avoiding materializing logits.
         if num_dropped == 0 or num_dropped == batch_size:
             outputs = model(**inputs)
+            loss_unscaled = outputs.loss.item()
             loss = outputs.loss
 
             if num_dropped == 0:
                 # Purely conditional batch: scale for expectation correction
                 loss = loss / (1.0 - cfg_drop_prob)
+                loss_cond_val = f"{loss_unscaled:.6f}"
+                loss_uncond_val = "N/A"
             else:
                 # Purely unconditional batch: scale for expectation correction
                 loss = -cfg_weight * loss / cfg_drop_prob
+                loss_cond_val = "N/A"
+                loss_uncond_val = f"{loss_unscaled:.6f}"
+
+            print(f"\n[GPU {self.accelerator.process_index}] [CFG Loss] Samples Dropped: {num_dropped} / {batch_size}")
+            print(f"  Conditional Loss:   {loss_cond_val}")
+            print(f"  Unconditional Loss: {loss_uncond_val}")
+            print(f"  Final Loss:         {loss.item():.6f}\n")
 
             return (loss, outputs) if return_outputs else loss
 
@@ -114,6 +124,13 @@ class QwenSFTTrainer(Trainer):
 
         # Scale each part by its probability for correct expected value
         loss = (loss_cond / (1.0 - cfg_drop_prob)) + cfg_weight * (-loss_uncond / cfg_drop_prob)
+
+        loss_cond_val = f"{loss_cond.item():.6f}" if cond_mask.any() else "N/A"
+        loss_uncond_val = f"{loss_uncond.item():.6f}" if uncond_mask.any() else "N/A"
+        print(f"\n[GPU {self.accelerator.process_index}] [CFG Loss] Samples Dropped: {num_dropped} / {batch_size}")
+        print(f"  Conditional Loss:   {loss_cond_val}")
+        print(f"  Unconditional Loss: {loss_uncond_val}")
+        print(f"  Final Loss:         {loss.item():.6f}\n")
 
         return (loss, outputs) if return_outputs else loss
 
@@ -170,6 +187,10 @@ class QwenSFTTrainer(Trainer):
 
             # Detach loss_uncond to avoid keeping its graph
             loss = torch.clamp(margin - loss_uncond.detach() + loss_cond, min=0.0)
+            print(f"\n[GPU {self.accelerator.process_index}] [CFG Margin Loss]")
+            print(f"  Conditional Loss:   {loss_cond.item():.6f}")
+            print(f"  Unconditional Loss: {loss_uncond.item():.6f}")
+            print(f"  Final Loss:         {loss.item():.6f}\n")
             return (loss, outputs_cond) if return_outputs else loss
 
         # Fallback for batch_size > 1
@@ -194,6 +215,10 @@ class QwenSFTTrainer(Trainer):
 
         # Detach loss_uncond to avoid keeping its graph
         loss = torch.clamp(margin - per_sample_loss_uncond.detach() + per_sample_loss_cond, min=0.0).mean()
+        print(f"\n[GPU {self.accelerator.process_index}] [CFG Margin Loss]")
+        print(f"  Conditional Loss:   {per_sample_loss_cond.mean().item():.6f}")
+        print(f"  Unconditional Loss: {per_sample_loss_uncond.mean().item():.6f}")
+        print(f"  Final Loss:         {loss.item():.6f}\n")
         return (loss, outputs_cond) if return_outputs else loss
     def compute_cfg_conf_reg_loss(self, model, inputs, is_dropped, return_outputs=False, **kwargs):
         """Compute the CFG confidence regularization loss."""
@@ -250,6 +275,16 @@ class QwenSFTTrainer(Trainer):
 
         # Scale each part by its probability for correct expected value
         loss = (loss_cond / (1.0 - cfg_drop_prob)) + cfg_weight * (-loss_uncond / cfg_drop_prob) - reg_weight * (entropy_uncond / cfg_drop_prob)
+
+        num_dropped = is_dropped.sum().item()
+        loss_cond_val = f"{loss_cond.item():.6f}" if cond_mask.any() else "N/A"
+        loss_uncond_val = f"{loss_uncond.item():.6f}" if uncond_mask.any() else "N/A"
+        entropy_uncond_val = f"{entropy_uncond.item():.6f}" if uncond_mask.any() else "N/A"
+        print(f"\n[GPU {self.accelerator.process_index}] [CFG Conf Reg Loss] Samples Dropped: {num_dropped} / {batch_size}")
+        print(f"  Conditional Loss:   {loss_cond_val}")
+        print(f"  Unconditional Loss: {loss_uncond_val}")
+        print(f"  Uncond Entropy:     {entropy_uncond_val}")
+        print(f"  Final Loss:         {loss.item():.6f}\n")
 
         return (loss, outputs) if return_outputs else loss
 

@@ -1,5 +1,27 @@
 #!/bin/bash
+loss_type="standard" # {standard, cfg, cfg_margin, cfg_conf_reg}
+cfg_loss_margin=1.0 # For cfg_margin only
+cfg_drop_prob=0.0 # For cfg, cfg_conf_reg
+cfg_loss_weight=0.0 # For cfg, cfg_conf_reg
+cfg_reg_weight=0.0 # For cfg_conf_reg
 
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --loss_type)
+      loss_type="$2"; shift 2 ;;
+    --cfg_loss_margin)
+      cfg_loss_margin="$2"; shift 2 ;;
+    --cfg_drop_prob)
+      cfg_drop_prob="$2"; shift 2 ;;
+    --cfg_loss_weight)
+      cfg_loss_weight="$2"; shift 2 ;;
+    --cfg_reg_weight)
+      cfg_reg_weight="$2"; shift 2 ;;
+    *)
+      echo "Unknown argument: $1"
+      exit 1 ;;
+  esac
+done
 
 # MODEL_NAME="Qwen/Qwen2-VL-7B-Instruct"
 MODEL_NAME="Qwen/Qwen2-VL-2B-Instruct"
@@ -14,6 +36,7 @@ GLOBAL_BATCH_SIZE=2
 BATCH_PER_DEVICE=1
 NUM_DEVICES=2
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (BATCH_PER_DEVICE * NUM_DEVICES)))
+
 
 # If you want to tune the `embed_token` with LoRA, You need to tune `lm_head` together
 # You should freeze the the merger also, becuase the merger is included in the vision_tower.
@@ -38,11 +61,11 @@ deepspeed src/train/train_sft.py \
     --model_id $MODEL_NAME \
     --data_path textvqa_llava.json\
     --image_folder textvqa_images \
-    --loss_type cfg \
-    --cfg_loss_margin 1.0 \
-    --cfg_drop_prob 0.5 \
-    --cfg_loss_weight 0.1 \
-    --cfg_reg_weight 0.0 \
+    --loss_type $loss_type \
+    --cfg_loss_margin $cfg_loss_margin \
+    --cfg_drop_prob $cfg_drop_prob \
+    --cfg_loss_weight $cfg_loss_weight \
+    --cfg_reg_weight $cfg_reg_weight \
     --remove_unused_columns False \
     --freeze_vision_tower True \
     --freeze_llm True \

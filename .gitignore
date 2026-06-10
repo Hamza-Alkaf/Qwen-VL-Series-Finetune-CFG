@@ -169,3 +169,8 @@ logs/*.log
 
 testing.ipynb
 .vscode/*
+
+#### Datasets
+textvqa_llava.json
+textvqa_images/
+
