@@ -2,16 +2,17 @@
 
 
 # MODEL_NAME="Qwen/Qwen2-VL-7B-Instruct"
-# MODEL_NAME="Qwen/Qwen2-VL-2B-Instruct"
+MODEL_NAME="Qwen/Qwen2-VL-2B-Instruct"
 # MODEL_NAME="Qwen/Qwen3.5-4B"
-MODEL_NAME="Qwen/Qwen2.5-VL-3B-Instruct"
+# MODEL_NAME="Qwen/Qwen2.5-VL-3B-Instruct"
 # MODEL_NAME="Qwen/Qwen2.5-VL-7B-Instruct"
+# MODEL_NAME="Qwen/Qwen3-VL-4B-Instruct"
 
 export PYTHONPATH=src:$PYTHONPATH
 
-GLOBAL_BATCH_SIZE=128
-BATCH_PER_DEVICE=4
-NUM_DEVICES=8
+GLOBAL_BATCH_SIZE=2
+BATCH_PER_DEVICE=1
+NUM_DEVICES=2
 GRAD_ACCUM_STEPS=$((GLOBAL_BATCH_SIZE / (BATCH_PER_DEVICE * NUM_DEVICES)))
 
 # If you want to tune the `embed_token` with LoRA, You need to tune `lm_head` together
@@ -29,21 +30,26 @@ deepspeed src/train/train_sft.py \
     --vision_lora True \
     --use_dora False \
     --lora_namespan_exclude "['lm_head', 'embed_tokens']" \
-    --lora_rank 32 \
-    --lora_alpha 64 \
+    --lora_rank 1 \
+    --lora_alpha 8 \
     --lora_dropout 0.05 \
     --num_lora_modules -1 \
     --deepspeed scripts/zero3.json \
     --model_id $MODEL_NAME \
-    --data_path /path/to/your/training/data.json \
-    --image_folder /path/to/your/image/folder \
+    --data_path textvqa_llava.json\
+    --image_folder textvqa_images \
+    --loss_type cfg \
+    --cfg_loss_margin 1.0 \
+    --cfg_drop_prob 0.5 \
+    --cfg_loss_weight 0.1 \
+    --cfg_reg_weight 0.0 \
     --remove_unused_columns False \
     --freeze_vision_tower True \
     --freeze_llm True \
     --freeze_merger True \
     --bf16 True \
     --fp16 False \
-    --disable_flash_attn2 False \
+    --disable_flash_attn2 True \
     --output_dir output/lora_vision_test \
     --num_train_epochs 1 \
     --per_device_train_batch_size $BATCH_PER_DEVICE \

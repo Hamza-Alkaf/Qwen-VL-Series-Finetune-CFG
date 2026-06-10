@@ -151,6 +151,24 @@ class TrainingArguments(HFTrainingArguments):
     num_lora_modules: int = -1
     use_liger_kernel: bool = True
 
+    # CFG training settings
+    loss_type: str = field(
+        default="standard",
+        metadata={"help": "Loss type to use. Should be 'standard', 'cfg', 'cfg_margin', or 'cfg_conf_reg'."},
+    )
+    cfg_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for the unconditional (negative) loss in CFG training. 0 = disabled."},
+    )
+    cfg_loss_margin: float = field(
+        default=1.0,
+        metadata={"help": "Margin for the CFG margin loss. Used when loss_type is 'cfg_margin'."},
+    )
+    cfg_reg_weight: float = field(
+        default=0.0,
+        metadata={"help": "Entropy regularization weight for CFG confidence regularization loss. Used when loss_type is 'cfg_conf_reg'."},
+    )
+
     # Generation-based evaluation settings
     generation_max_new_tokens: int = field(
         default=512,
@@ -310,4 +328,8 @@ class DataArguments:
     enable_reasoning: bool = field(
         default=False,
         metadata={"help": "Enable reasoning-field parsing and model-specific <think> prompt formatting when supported."},
+    )
+    cfg_drop_prob: float = field(
+        default=0.0,
+        metadata={"help": "Probability of dropping image (replacing pixel values with zeros) for CFG training. 0 = disabled."},
     )

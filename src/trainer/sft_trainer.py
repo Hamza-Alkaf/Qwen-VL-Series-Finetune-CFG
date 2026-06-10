@@ -54,6 +54,222 @@ class QwenSFTTrainer(Trainer):
         # processing_class is set by parent Trainer from the constructor argument
         # We can access it via self.processing_class (same as processor)
 
+    def compute_cfg_loss(self, model, inputs, is_dropped, return_outputs=False, **kwargs):
+        """Compute the Classifier-Free Guidance (CFG) dual loss."""
+        cfg_weight = getattr(self.args, "cfg_loss_weight", 0.0)
+        cfg_drop_prob = getattr(self.args, "cfg_drop_prob", 0.0)
+        
+        # Fast path: CFG completely disabled — use model's internal CE
+        if cfg_weight == 0.0 or cfg_drop_prob == 0.0 or is_dropped is None:
+            outputs = model(**inputs)
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        num_dropped = is_dropped.sum().item()
+        batch_size = is_dropped.size(0)
+
+        # Homogeneous batches (purely conditional or purely unconditional).
+        # This is ALWAYS true when batch_size == 1 per device.
+        # It keeps Liger Kernel fully active since we pass labels, avoiding materializing logits.
+        if num_dropped == 0 or num_dropped == batch_size:
+            outputs = model(**inputs)
+            loss = outputs.loss
+
+            if num_dropped == 0:
+                # Purely conditional batch: scale for expectation correction
+                loss = loss / (1.0 - cfg_drop_prob)
+            else:
+                # Purely unconditional batch: scale for expectation correction
+                loss = -cfg_weight * loss / cfg_drop_prob
+
+            return (loss, outputs) if return_outputs else loss
+
+        # Fallback for mixed batches (only possible when batch_size > 1).
+        # We manually compute shifted CE to calculate cond/uncond separately.
+        # We process sample-by-sample to avoid contiguous() allocations of the full batch logits.
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits             # (B, seq_len, vocab_size)
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+        per_sample_loss = []
+
+        for i in range(batch_size):
+            # Slicing the first dimension of a contiguous 3D tensor returns a contiguous 2D tensor.
+            shift_logits_i = logits[i, :-1, :]  # shape: (seq_len - 1, vocab_size)
+            shift_labels_i = labels[i, 1:]     # shape: (seq_len - 1)
+
+            loss_i = loss_fct(shift_logits_i, shift_labels_i)
+            mask_i = shift_labels_i != IGNORE_INDEX
+            mean_loss_i = loss_i[mask_i].sum() / mask_i.sum().clamp(min=1)
+            per_sample_loss.append(mean_loss_i)
+
+        per_sample_loss = torch.stack(per_sample_loss)
+
+        cond_mask = ~is_dropped
+        uncond_mask = is_dropped
+
+        loss_cond = per_sample_loss[cond_mask].mean() if cond_mask.any() else torch.tensor(0.0, device=logits.device)
+        loss_uncond = per_sample_loss[uncond_mask].mean() if uncond_mask.any() else torch.tensor(0.0, device=logits.device)
+
+        # Scale each part by its probability for correct expected value
+        loss = (loss_cond / (1.0 - cfg_drop_prob)) + cfg_weight * (-loss_uncond / cfg_drop_prob)
+
+        return (loss, outputs) if return_outputs else loss
+
+
+    def compute_cfg_margin_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Compute the CFG margin loss: max(0, margin - log(P(y|img, txt)/P(y|dropped, txt)))."""
+        margin = getattr(self.args, "cfg_loss_margin", 1.0)
+        batch_size = inputs["input_ids"].size(0)
+
+        # Clone inputs to create the unconditional inputs (zeroed out images)
+        import copy
+        inputs_uncond = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                inputs_uncond[k] = v.clone()
+            else:
+                inputs_uncond[k] = copy.deepcopy(v)
+
+        # Zero out pixel values for the unconditional pass
+        if "pixel_values" in inputs_uncond:
+            inputs_uncond["pixel_values"] = torch.zeros_like(inputs_uncond["pixel_values"])
+
+        # Unconditional pass: Run with no_grad to avoid keeping activations in memory
+        with torch.no_grad():
+            if batch_size == 1:
+                outputs_uncond = model(**inputs_uncond)
+                loss_uncond = outputs_uncond.loss
+            else:
+                # Fallback for batch_size > 1
+                labels = inputs.get("labels")
+                outputs_uncond = model(**inputs_uncond)
+                logits_uncond = outputs_uncond.logits
+
+                loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+                per_sample_loss_uncond = []
+
+                for i in range(batch_size):
+                    shift_logits_uncond_i = logits_uncond[i, :-1, :]
+                    shift_labels_i = labels[i, 1:]
+                    mask_i = shift_labels_i != IGNORE_INDEX
+                    num_tokens_i = mask_i.sum().clamp(min=1)
+
+                    loss_uncond_i = loss_fct(shift_logits_uncond_i, shift_labels_i)
+                    mean_loss_uncond_i = loss_uncond_i[mask_i].sum() / num_tokens_i
+                    per_sample_loss_uncond.append(mean_loss_uncond_i)
+
+                per_sample_loss_uncond = torch.stack(per_sample_loss_uncond)
+                loss_uncond = per_sample_loss_uncond
+
+        # Conditional pass: Run with gradients enabled (activations cached for backward)
+        if batch_size == 1:
+            outputs_cond = model(**inputs)
+            loss_cond = outputs_cond.loss
+
+            # Detach loss_uncond to avoid keeping its graph
+            loss = torch.clamp(margin - loss_uncond.detach() + loss_cond, min=0.0)
+            return (loss, outputs_cond) if return_outputs else loss
+
+        # Fallback for batch_size > 1
+        labels = inputs.pop("labels")
+        outputs_cond = model(**inputs)
+        logits_cond = outputs_cond.logits
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+        per_sample_loss_cond = []
+
+        for i in range(batch_size):
+            shift_logits_cond_i = logits_cond[i, :-1, :]
+            shift_labels_i = labels[i, 1:]
+            mask_i = shift_labels_i != IGNORE_INDEX
+            num_tokens_i = mask_i.sum().clamp(min=1)
+
+            loss_cond_i = loss_fct(shift_logits_cond_i, shift_labels_i)
+            mean_loss_cond_i = loss_cond_i[mask_i].sum() / num_tokens_i
+            per_sample_loss_cond.append(mean_loss_cond_i)
+
+        per_sample_loss_cond = torch.stack(per_sample_loss_cond)
+
+        # Detach loss_uncond to avoid keeping its graph
+        loss = torch.clamp(margin - per_sample_loss_uncond.detach() + per_sample_loss_cond, min=0.0).mean()
+        return (loss, outputs_cond) if return_outputs else loss
+    def compute_cfg_conf_reg_loss(self, model, inputs, is_dropped, return_outputs=False, **kwargs):
+        """Compute the CFG confidence regularization loss."""
+        cfg_weight = getattr(self.args, "cfg_loss_weight", 0.0)
+        cfg_drop_prob = getattr(self.args, "cfg_drop_prob", 0.0)
+        reg_weight = getattr(self.args, "cfg_reg_weight", 0.0)
+
+        # Fast path: CFG completely disabled — use model's internal CE
+        if cfg_weight == 0.0 or is_dropped is None or cfg_drop_prob == 0.0:
+            outputs = model(**inputs)
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        batch_size = is_dropped.size(0)
+
+        # Pop labels to prevent the model from computing cross entropy internally.
+        # This guarantees outputs.logits is returned (not None) and ensures all ranks
+        # run the same forward graph to prevent distributed deadlocks/hanging.
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+        per_sample_loss = []
+        per_sample_entropy = []
+
+        for i in range(batch_size):
+            shift_logits_i = logits[i, :-1, :]
+            shift_labels_i = labels[i, 1:]
+            mask_i = shift_labels_i != IGNORE_INDEX
+            num_tokens_i = mask_i.sum().clamp(min=1)
+
+            # Cross entropy loss
+            loss_i = loss_fct(shift_logits_i, shift_labels_i)
+            mean_loss_i = loss_i[mask_i].sum() / num_tokens_i
+            per_sample_loss.append(mean_loss_i)
+
+            # Entropy H
+            log_probs_i = torch.log_softmax(shift_logits_i, dim=-1)
+            probs_i = torch.softmax(shift_logits_i, dim=-1)
+            entropy_i = -(probs_i * log_probs_i).sum(dim=-1)
+            mean_entropy_i = entropy_i[mask_i].sum() / num_tokens_i
+            per_sample_entropy.append(mean_entropy_i)
+
+        per_sample_loss = torch.stack(per_sample_loss)
+        per_sample_entropy = torch.stack(per_sample_entropy)
+
+        cond_mask = ~is_dropped
+        uncond_mask = is_dropped
+
+        loss_cond = per_sample_loss[cond_mask].mean() if cond_mask.any() else torch.tensor(0.0, device=logits.device)
+        loss_uncond = per_sample_loss[uncond_mask].mean() if uncond_mask.any() else torch.tensor(0.0, device=logits.device)
+        entropy_uncond = per_sample_entropy[uncond_mask].mean() if uncond_mask.any() else torch.tensor(0.0, device=logits.device)
+
+        # Scale each part by its probability for correct expected value
+        loss = (loss_cond / (1.0 - cfg_drop_prob)) + cfg_weight * (-loss_uncond / cfg_drop_prob) - reg_weight * (entropy_uncond / cfg_drop_prob)
+
+        return (loss, outputs) if return_outputs else loss
+
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Override to support CFG dual loss (conditional + negative unconditional)."""
+        # Pop custom key — model.forward() doesn't expect it
+        is_dropped = inputs.pop("is_image_dropped", None)
+
+        loss_type = getattr(self.args, "loss_type", "standard")
+        if loss_type == "cfg":
+            return self.compute_cfg_loss(model, inputs, is_dropped, return_outputs=return_outputs, **kwargs)
+        elif loss_type == "cfg_margin":
+            return self.compute_cfg_margin_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        elif loss_type == "cfg_conf_reg":
+            return self.compute_cfg_conf_reg_loss(model, inputs, is_dropped, return_outputs=return_outputs, **kwargs)
+
+        return super(QwenSFTTrainer, self).compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -179,6 +395,7 @@ class QwenSFTTrainer(Trainer):
             self.model.base_model.config.to_json_file(os.path.join(output_dir, "config.json"))
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs.pop("is_image_dropped", None)  # Remove custom key before model forward
         labels = inputs.get("labels") if "labels" in inputs else None
 
         with torch.no_grad():
@@ -353,6 +570,7 @@ class QwenSFTTrainer(Trainer):
         for step, inputs in enumerate(dataloader):
             # Move inputs to device
             inputs = self._prepare_inputs(inputs)
+            inputs.pop("is_image_dropped", None)  # Remove custom key before model forward
 
             batch_input_ids = inputs["input_ids"]
             batch_labels = inputs["labels"]
