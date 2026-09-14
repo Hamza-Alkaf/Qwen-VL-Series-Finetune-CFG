@@ -96,6 +96,8 @@ def train():
     if training_args.loss_type == "cfg_margin":
         if data_args.cfg_drop_prob > 0.0:
             raise ValueError("When `loss_type` is 'cfg_margin', `cfg_drop_prob` must be 0.0 because the conditional and unconditional passes are both run per-sample inside the trainer.")
+        if training_args.cfg_loss_weight > 0.0:
+            raise ValueError("When `loss_type` is 'cfg_margin', `cfg_loss_weight` must be 0.0: the margin objective weights the unconditional term through `cfg_loss_margin`, and `cfg_loss_weight` would be silently ignored.")
     elif training_args.loss_type == "cfg":
         if data_args.cfg_drop_prob <= 0.0:
             raise ValueError("When `loss_type` is 'cfg', `cfg_drop_prob` must be greater than 0.0 to enable image dropout.")
