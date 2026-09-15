@@ -1,9 +1,9 @@
 #!/bin/bash
 loss_type="standard" # {standard, cfg, cfg_margin, cfg_conf_reg}
-cfg_loss_margin=1.0 # For cfg_margin only
-cfg_drop_prob=0.0 # For cfg, cfg_conf_reg
+cfg_loss_margin=0.2 # For cfg_margin only
 cfg_loss_weight=0.0 # For cfg, cfg_conf_reg
 cfg_reg_weight=0.0 # For cfg_conf_reg
+cfg_uncond_cap=5.0 # For cfg, cfg_conf_reg: clamp on CE_uncond
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -11,12 +11,12 @@ while [[ $# -gt 0 ]]; do
       loss_type="$2"; shift 2 ;;
     --cfg_loss_margin)
       cfg_loss_margin="$2"; shift 2 ;;
-    --cfg_drop_prob)
-      cfg_drop_prob="$2"; shift 2 ;;
     --cfg_loss_weight)
       cfg_loss_weight="$2"; shift 2 ;;
     --cfg_reg_weight)
       cfg_reg_weight="$2"; shift 2 ;;
+    --cfg_uncond_cap)
+      cfg_uncond_cap="$2"; shift 2 ;;
     *)
       echo "Unknown argument: $1"
       exit 1 ;;
@@ -63,9 +63,9 @@ deepspeed src/train/train_sft.py \
     --image_folder textvqa_images \
     --loss_type $loss_type \
     --cfg_loss_margin $cfg_loss_margin \
-    --cfg_drop_prob $cfg_drop_prob \
     --cfg_loss_weight $cfg_loss_weight \
     --cfg_reg_weight $cfg_reg_weight \
+    --cfg_uncond_cap $cfg_uncond_cap \
     --remove_unused_columns False \
     --freeze_vision_tower True \
     --freeze_llm True \

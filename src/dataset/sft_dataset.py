@@ -1,6 +1,5 @@
 import copy
 import os
-import random
 from typing import Dict
 import torch
 import transformers
@@ -62,7 +61,6 @@ class SupervisedDataset(Dataset):
         self.video_resized_h = data_args.video_resized_height
         self.fps = data_args.fps
         self.nframes = data_args.nframes
-        self.cfg_drop_prob = data_args.cfg_drop_prob
 
         self.model_type, self.image_patch_size, self.return_video_metadata = get_qwen_multimodal_settings(
             self.model_id
@@ -301,15 +299,6 @@ class SupervisedDataset(Dataset):
             second_gird = all_second_gird
             data_dict["second_per_grid_ts"] = second_gird
 
-        # CFG: randomly zero out pixel values
-        is_image_dropped = False
-        if self.cfg_drop_prob > 0 and pixel_key and pixel_key in data_dict:
-            if random.random() < self.cfg_drop_prob:
-                is_image_dropped = True
-                data_dict[pixel_key] = torch.zeros_like(data_dict[pixel_key])
-
-        data_dict["is_image_dropped"] = torch.tensor(is_image_dropped, dtype=torch.bool)
-
         return data_dict
 
 class DataCollatorForSupervisedDataset(object):
@@ -373,10 +362,6 @@ class DataCollatorForSupervisedDataset(object):
 
         if len(batch_second_per_grid_ts) > 0:
             data_dict["second_per_grid_ts"] = batch_second_per_grid_ts
-
-        # CFG: stack is_image_dropped flags
-        batch_is_dropped = torch.stack([ex["is_image_dropped"] for ex in examples])
-        data_dict["is_image_dropped"] = batch_is_dropped
 
         return data_dict
 
