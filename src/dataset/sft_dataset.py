@@ -1,6 +1,5 @@
 import copy
 import os
-import random
 from typing import Dict
 import torch
 import transformers
@@ -40,7 +39,6 @@ class SupervisedDataset(Dataset):
         data_args: DataArguments,
         model_id,
         padding=True,
-        cfg_drop_prob=None,
     ):
         super(SupervisedDataset, self).__init__()
         if isinstance(data_path, str):
@@ -63,15 +61,6 @@ class SupervisedDataset(Dataset):
         self.video_resized_h = data_args.video_resized_height
         self.fps = data_args.fps
         self.nframes = data_args.nframes
-        # Overridable so the eval split can disable dropout: the eval dataset is
-        # built from the same data_args, so it used to drop images too and the
-        # reported eval loss was a random mixture of conditional and
-        # gray-image losses that moved with the RNG rather than the model.
-        self.cfg_drop_prob = (
-            data_args.cfg_drop_prob if cfg_drop_prob is None else cfg_drop_prob
-        )
-        self._drop_rng_state = None
-        self._drop_rng_pid = None
 
         self.model_type, self.image_patch_size, self.return_video_metadata = get_qwen_multimodal_settings(
             self.model_id
@@ -84,24 +73,6 @@ class SupervisedDataset(Dataset):
                 f"`enable_reasoning` is only supported for Qwen3-VL Thinking or Qwen3.5 models with official reasoning chat templates. "
                 f"Current model_type={self.model_type!r} does not qualify."
             )
-
-    def _drop_rng(self) -> random.Random:
-        """Per-rank, per-worker RNG for the CFG image dropout.
-
-        The global `random` module is seeded identically on every rank by
-        `set_seed()`, so with `dataloader_num_workers=0` every rank drew the
-        *same* drop decisions in lockstep. At batch_size 1 per device that turns
-        whole global steps into pure gradient ascent on -w*CE, which is both much
-        higher variance than intended and a real divergence risk. Folding the
-        rank into the seed decorrelates the ranks; re-seeding when the pid
-        changes gives each dataloader worker its own stream.
-        """
-        if self._drop_rng_state is None or self._drop_rng_pid != os.getpid():
-            seed = torch.initial_seed() % (2 ** 31)
-            seed += int(os.environ.get("RANK", "0")) * 1_000_003
-            self._drop_rng_state = random.Random(seed)
-            self._drop_rng_pid = os.getpid()
-        return self._drop_rng_state
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -328,15 +299,6 @@ class SupervisedDataset(Dataset):
             second_gird = all_second_gird
             data_dict["second_per_grid_ts"] = second_gird
 
-        # CFG: randomly zero out pixel values
-        is_image_dropped = False
-        if self.cfg_drop_prob > 0 and pixel_key and pixel_key in data_dict:
-            if self._drop_rng().random() < self.cfg_drop_prob:
-                is_image_dropped = True
-                data_dict[pixel_key] = torch.zeros_like(data_dict[pixel_key])
-
-        data_dict["is_image_dropped"] = torch.tensor(is_image_dropped, dtype=torch.bool)
-
         return data_dict
 
 class DataCollatorForSupervisedDataset(object):
@@ -401,10 +363,6 @@ class DataCollatorForSupervisedDataset(object):
         if len(batch_second_per_grid_ts) > 0:
             data_dict["second_per_grid_ts"] = batch_second_per_grid_ts
 
-        # CFG: stack is_image_dropped flags
-        batch_is_dropped = torch.stack([ex["is_image_dropped"] for ex in examples])
-        data_dict["is_image_dropped"] = batch_is_dropped
-
         return data_dict
 
 def make_supervised_data_module(model_id, processor, data_args):
@@ -418,8 +376,7 @@ def make_supervised_data_module(model_id, processor, data_args):
               data_path=data_args.eval_path,
               processor=processor,
               data_args=data_args,
-              model_id=model_id,
-              cfg_drop_prob=0.0,  # never drop images when measuring eval loss
+              model_id=model_id
           )
         
     data_collator = DataCollatorForSupervisedDataset(pad_token_id=processor.tokenizer.pad_token_id)

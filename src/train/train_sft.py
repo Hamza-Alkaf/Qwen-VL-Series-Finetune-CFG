@@ -87,38 +87,53 @@ def train():
     
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    training_args.cfg_drop_prob = data_args.cfg_drop_prob
-
-    # CFG Parameter Validation Rules
+    # CFG parameter validation. Every CFG loss now derives its own unconditional
+    # branch with a second forward pass, so there is no image-dropout probability
+    # to configure and no flag riding through the collator.
     if training_args.loss_type not in ["standard", "cfg", "cfg_margin", "cfg_conf_reg"]:
-        raise ValueError(f"Unknown loss_type: {training_args.loss_type}. Must be 'standard', 'cfg', 'cfg_margin', or 'cfg_conf_reg'.")
+        raise ValueError(
+            f"Unknown loss_type: {training_args.loss_type}. Must be 'standard', "
+            f"'cfg', 'cfg_margin', or 'cfg_conf_reg'."
+        )
+
+    if training_args.loss_type in ("cfg", "cfg_conf_reg"):
+        if training_args.cfg_loss_weight <= 0.0:
+            raise ValueError(
+                f"When `loss_type` is '{training_args.loss_type}', `cfg_loss_weight` "
+                f"must be greater than 0.0 to weight the unconditional loss."
+            )
+        if training_args.cfg_uncond_cap <= 0.0:
+            raise ValueError(
+                "`cfg_uncond_cap` must be greater than 0.0: it is the upper clamp on "
+                "the unconditional cross-entropy that keeps -w*CE_uncond from running "
+                "away."
+            )
+    elif training_args.cfg_loss_weight != 0.0:
+        raise ValueError(
+            f"`cfg_loss_weight` is set, but `loss_type` is "
+            f"'{training_args.loss_type}', which does not use it. Set `--loss_type "
+            f"cfg` or `--loss_type cfg_conf_reg`, or leave `cfg_loss_weight` at 0."
+        )
+
+    if training_args.loss_type == "cfg_conf_reg":
+        if training_args.cfg_reg_weight <= 0.0:
+            raise ValueError(
+                "When `loss_type` is 'cfg_conf_reg', `cfg_reg_weight` must be greater "
+                "than 0.0 to weight the entropy regularization."
+            )
+    elif training_args.cfg_reg_weight != 0.0:
+        raise ValueError(
+            f"`cfg_reg_weight` is set, but `loss_type` is "
+            f"'{training_args.loss_type}'. Set `--loss_type cfg_conf_reg` or remove "
+            f"`--cfg_reg_weight`."
+        )
 
     if training_args.loss_type == "cfg_margin":
-        if data_args.cfg_drop_prob > 0.0:
-            raise ValueError("When `loss_type` is 'cfg_margin', `cfg_drop_prob` must be 0.0 because the conditional and unconditional passes are both run per-sample inside the trainer.")
-        if training_args.cfg_loss_weight > 0.0:
-            raise ValueError("When `loss_type` is 'cfg_margin', `cfg_loss_weight` must be 0.0: the margin objective weights the unconditional term through `cfg_loss_margin`, and `cfg_loss_weight` would be silently ignored.")
-    elif training_args.loss_type == "cfg":
-        if data_args.cfg_drop_prob <= 0.0:
-            raise ValueError("When `loss_type` is 'cfg', `cfg_drop_prob` must be greater than 0.0 to enable image dropout.")
-        if training_args.cfg_loss_weight <= 0.0:
-            raise ValueError("When `loss_type` is 'cfg', `cfg_loss_weight` must be greater than 0.0 to weight the unconditional loss.")
-    elif training_args.loss_type == "cfg_conf_reg":
-        if data_args.cfg_drop_prob <= 0.0:
-            raise ValueError("When `loss_type` is 'cfg_conf_reg', `cfg_drop_prob` must be greater than 0.0 to enable image dropout.")
-        if training_args.cfg_loss_weight <= 0.0:
-            raise ValueError("When `loss_type` is 'cfg_conf_reg', `cfg_loss_weight` must be greater than 0.0 to weight the unconditional loss.")
-        if training_args.cfg_reg_weight <= 0.0:
-            raise ValueError("When `loss_type` is 'cfg_conf_reg', `cfg_reg_weight` must be greater than 0.0 to weight the entropy regularization.")
-    elif training_args.loss_type == "standard":
-        if data_args.cfg_drop_prob > 0.0 or training_args.cfg_loss_weight > 0.0 or training_args.cfg_reg_weight > 0.0:
-            raise ValueError("Parameters `cfg_drop_prob`, `cfg_loss_weight`, or `cfg_reg_weight` are set, but `loss_type` is 'standard'. Set `--loss_type cfg` or `--loss_type cfg_conf_reg` to use them, or set them to 0 otherwise.")
-
-    if training_args.loss_type != "cfg_margin" and training_args.cfg_loss_margin != 1.0:
-        raise ValueError("Parameter `cfg_loss_margin` is set, but `loss_type` is not 'cfg_margin'. Set `--loss_type cfg_margin` or remove `--cfg_loss_margin`.")
-
-    if training_args.loss_type != "cfg_conf_reg" and training_args.cfg_reg_weight != 0.0:
-        raise ValueError("Parameter `cfg_reg_weight` is set, but `loss_type` is not 'cfg_conf_reg'. Set `--loss_type cfg_conf_reg` or remove `--cfg_reg_weight`.")
+        if training_args.cfg_loss_margin <= 0.0:
+            raise ValueError(
+                "When `loss_type` is 'cfg_margin', `cfg_loss_margin` must be greater "
+                "than 0.0."
+            )
 
     if data_args.nframes is not None and data_args.fps is not None:
         raise ValueError("You cannot set both `nframes` and `fps` at the same time. Please set only one of them.")

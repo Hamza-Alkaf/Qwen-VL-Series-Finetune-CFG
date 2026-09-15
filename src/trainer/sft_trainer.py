@@ -56,13 +56,12 @@ class QwenSFTTrainer(Trainer):
         # We can access it via self.processing_class (same as processor)
         self._cfg_metric_buffer: Dict[str, List[torch.Tensor]] = {}
 
-        # `cfg_margin` returns a per-sample hinge, not a token-normalised sum, so
-        # it cannot honour `num_items_in_batch`. Declaring that the model does not
-        # accept loss kwargs makes Trainer apply its own division by
-        # `gradient_accumulation_steps`, which is the correct averaging for this
-        # objective. The other CFG losses *do* normalise by `num_items_in_batch`
-        # themselves, so they keep the default behaviour.
-        if getattr(self.args, "loss_type", "standard") == "cfg_margin":
+        # Every CFG objective returns a per-sample mean over the micro-batch, not
+        # a token-normalised sum, so none of them can honour `num_items_in_batch`.
+        # Declaring that the model does not accept loss kwargs makes Trainer apply
+        # its own division by `gradient_accumulation_steps`, which is the correct
+        # averaging for these objectives.
+        if getattr(self.args, "loss_type", "standard") != "standard":
             self.model_accepts_loss_kwargs = False
 
     # ------------------------------------------------------------------
@@ -134,271 +133,200 @@ class QwenSFTTrainer(Trainer):
 
         return loss_sum, num_tokens, entropy_sum
 
-    @staticmethod
-    def _cfg_denominator(num_items_in_batch, fallback_tokens):
-        """Token denominator matching what the plain-SFT path gets from HF.
 
-        ``Qwen*ForConditionalGeneration.forward`` takes ``**kwargs``, so
-        ``Trainer.model_accepts_loss_kwargs`` is True and Trainer therefore skips
-        its own division by ``gradient_accumulation_steps``, expecting
-        ``compute_loss`` to have normalised by ``num_items_in_batch`` instead.
-        The first version of this file ignored the kwarg entirely, which left
-        every CFG run scaled by grad-accum steps relative to the ``standard``
-        baseline -- so identical ``--learning_rate`` values were not comparable
-        across the two.
+    def _cfg_uncond_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy ``inputs`` with the visual stream blanked.
+
+        Zeroes whichever of ``pixel_values`` / ``pixel_values_videos`` the batch
+        actually carries. A text-only batch has no visual stream to drop, so the
+        two passes would be identical and every CFG objective would collapse to a
+        constant with no gradient; that is raised rather than silently trained on.
         """
-        if num_items_in_batch is None:
-            return fallback_tokens.clamp(min=1.0)
-        if torch.is_tensor(num_items_in_batch):
-            return num_items_in_batch.to(
-                device=fallback_tokens.device, dtype=torch.float32
-            ).clamp(min=1.0)
-        return float(max(int(num_items_in_batch), 1))
+        uncond = {
+            key: (value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value))
+            for key, value in inputs.items()
+        }
+        visual_keys = [
+            key for key in ("pixel_values", "pixel_values_videos") if key in uncond
+        ]
+        if not visual_keys:
+            raise ValueError(
+                "The CFG losses need a visual input to drop, but this batch carries "
+                "neither `pixel_values` nor `pixel_values_videos`. For a text-only "
+                "sample the conditional and unconditional passes are identical, so "
+                "the objective is a constant with no gradient. Filter text-only "
+                "samples out of the dataset, or use --loss_type standard."
+            )
+        for key in visual_keys:
+            uncond[key] = torch.zeros_like(uncond[key])
+        return uncond
 
-    def compute_cfg_loss(self, model, inputs, is_dropped, return_outputs=False,
-                         num_items_in_batch=None, **kwargs):
-        """CFG dual loss: ``E[CE | image kept] - w * E[CE | image dropped]``.
+    def _cfg_per_sample_ce(self, model, inputs, labels, batch_size):
+        """Per-sample mean CE over supervised tokens, plus the raw outputs.
 
-        Both terms are token-weighted (matching the plain-SFT baseline) and
-        divided by the probability of the branch that produced them, which makes
-        the per-step estimator unbiased for the objective above.
+        Labels are popped by the caller and passed in explicitly so that the
+        forward graph is identical on every rank: with ``use_liger_kernel=True``
+        the fused path returns ``logits=None`` whenever labels are present, so a
+        rank that kept its labels would take a different code path from one that
+        did not and desynchronise ZeRO-3's all-gathers.
+        """
+        outputs = model(**inputs)
+        stats = [
+            self._cfg_token_stats(outputs.logits[i], labels[i]) for i in range(batch_size)
+        ]
+        per_sample = torch.stack([s[0] / s[1].clamp(min=1.0) for s in stats])
+        return per_sample, outputs
+
+    def compute_cfg_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """CFG dual loss: ``CE_cond - w * min(CE_uncond, cap)``.
+
+        Both branches are computed for every sample by an explicit second forward
+        pass, so there is no sampling noise and no branch-probability correction.
+
+        The unconditional term is capped. Plain ``-w * CE_uncond`` is unbounded
+        below: the optimiser is paid to make the model arbitrarily bad without the
+        image, and since both branches share every weight that damage is not
+        contained. A 32-step run of the uncapped objective drove ``CE_uncond``
+        from 3.6 to 13.4 while the loss went negative. Clamping means the term
+        stops paying out once the image is worth ``cfg_uncond_cap`` nats, which is
+        all the objective ever wanted.
         """
         weight = self.args.cfg_loss_weight
-        drop_prob = self.args.cfg_drop_prob
-        batch_size = is_dropped.size(0)
+        cap = self.args.cfg_uncond_cap
+        batch_size = inputs["input_ids"].size(0)
 
-        # A single-sample micro-batch is homogeneous by construction, so the
-        # model's own fused CE can be used and Liger never materialises logits.
-        # The branch is keyed on batch size -- which is identical on every rank,
-        # since the distributed samplers pad -- and NOT on whether this rank's
-        # batch happens to be mixed. Branching on the latter let one rank run the
-        # fused path (labels kept, lm_head weight read directly) while another ran
-        # the unfused path (labels popped, lm_head called as a module), giving
-        # ZeRO-3 mismatched all-gather sequences across ranks.
-        if batch_size == 1:
-            outputs = model(**inputs)
-            num_tokens = (inputs["labels"][:, 1:] != IGNORE_INDEX).sum().to(torch.float32)
-            denom = self._cfg_denominator(num_items_in_batch, num_tokens)
-            # outputs.loss is the mean over supervised tokens; recover the sum so
-            # it renormalises against `denom` exactly like the manual path below.
-            loss_sum = outputs.loss.float() * num_tokens
-
-            if bool(is_dropped[0]):
-                loss = -weight * loss_sum / (denom * drop_prob)
-                self._record_cfg(cfg_loss_uncond=outputs.loss.detach())
-            else:
-                loss = loss_sum / (denom * (1.0 - drop_prob))
-                self._record_cfg(cfg_loss_cond=outputs.loss.detach())
-            self._record_cfg(cfg_frac_dropped=is_dropped.float().mean().detach())
-            return (loss, outputs) if return_outputs else loss
-
-        # batch_size > 1: labels are popped on *every* rank, not only on ranks
-        # that happen to hold a mixed batch, so the forward graph stays identical
-        # across the process group.
+        inputs_uncond = self._cfg_uncond_inputs(inputs)
         labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
+        inputs_uncond.pop("labels", None)
 
-        stats = [self._cfg_token_stats(logits[i], labels[i]) for i in range(batch_size)]
-        loss_sums = torch.stack([s[0] for s in stats])
-        tok_counts = torch.stack([s[1] for s in stats])
+        # Only the conditional branch carries gradient. The unconditional pass is
+        # a measurement of how much the image is worth, not something to optimise
+        # directly, so running it under no_grad also keeps its activations off the
+        # tape.
+        with torch.no_grad():
+            per_sample_uncond, _ = self._cfg_per_sample_ce(
+                model, inputs_uncond, labels, batch_size
+            )
 
-        cond_mask = ~is_dropped
-        sum_cond = (loss_sums * cond_mask).sum()
-        sum_uncond = (loss_sums * is_dropped).sum()
-        total_tokens = tok_counts.sum()
-        denom = self._cfg_denominator(num_items_in_batch, total_tokens)
+        per_sample_cond, outputs = self._cfg_per_sample_ce(
+            model, inputs, labels, batch_size
+        )
 
-        # Each group is weighted by its share of the batch's tokens (implicit in
-        # summing rather than averaging) and then by its branch probability. That
-        # is what makes this agree with the batch_size == 1 case above.
-        #
-        # Dividing group *means* by (1-p) and p -- as the first version did --
-        # double-corrects, because a group mean has already removed the
-        # probability factor. At p=0.1, w=0.1 the intended
-        #   L_cond - 0.1 * L_uncond
-        # came out as
-        #   1.11 * L_cond - 1.0 * L_uncond,
-        # a 10x overweight on the unconditional term.
-        loss = sum_cond / (denom * (1.0 - drop_prob)) \
-            - weight * sum_uncond / (denom * drop_prob)
+        capped_uncond = per_sample_uncond.detach().clamp(max=cap)
+        loss = (per_sample_cond - weight * capped_uncond).mean()
 
-        tok_cond = (tok_counts * cond_mask).sum().clamp(min=1.0)
-        tok_uncond = (tok_counts * is_dropped).sum().clamp(min=1.0)
         self._record_cfg(
-            cfg_loss_cond=(sum_cond / tok_cond).detach(),
-            cfg_loss_uncond=(sum_uncond / tok_uncond).detach(),
-            cfg_frac_dropped=is_dropped.float().mean().detach(),
+            cfg_loss_cond=per_sample_cond.mean().detach(),
+            cfg_loss_uncond=per_sample_uncond.mean().detach(),
+            cfg_uncond_capped=(per_sample_uncond > cap).float().mean().detach(),
         )
         return (loss, outputs) if return_outputs else loss
 
     def compute_cfg_margin_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Hinge on the CFG log-ratio.
 
-        ``max(0, margin - [log P(y|img,txt) - log P(y|dropped,txt)])``; with
-        ``L = -log P`` averaged over supervised tokens that is
-        ``max(0, margin - L_uncond + L_cond)``. Only the conditional term carries
-        gradient -- the unconditional pass runs under ``no_grad`` and is detached.
+        ``max(0, margin - [log P(y|img) - log P(y|blank)])``; with ``L = -log P``
+        averaged over supervised tokens that is
+        ``max(0, margin - CE_uncond + CE_cond)``. Only the conditional term
+        carries gradient.
 
-        This is a per-sample hinge rather than a token-normalised sum, so it does
-        not consume ``num_items_in_batch``; see ``__init__`` for how the
-        grad-accum averaging is arranged instead.
+        The hinge is the one CFG objective with a ceiling by construction: once
+        the image is worth ``margin`` nats the sample stops contributing. That
+        only works if ``margin`` is on the scale of the actual per-token CE gap --
+        at the old default of 1.0 against an observed gap near 0.23 the hinge was
+        active on 100% of samples and degenerated into the unbounded dual loss.
         """
         margin = self.args.cfg_loss_margin
         batch_size = inputs["input_ids"].size(0)
 
-        inputs_uncond = {
-            key: (value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value))
-            for key, value in inputs.items()
-        }
-
-        # Zero whichever visual stream this batch actually carries. Only
-        # `pixel_values` was handled before, so a video batch ran an
-        # unconditional pass byte-identical to the conditional one: the hinge
-        # collapsed to clamp(margin, 0), a constant with zero gradient, and
-        # training silently did nothing at all.
-        visual_keys = [
-            key for key in ("pixel_values", "pixel_values_videos") if key in inputs_uncond
-        ]
-        if not visual_keys:
-            raise ValueError(
-                "loss_type='cfg_margin' needs a visual input to drop, but this batch "
-                "carries neither `pixel_values` nor `pixel_values_videos`. For a "
-                "text-only sample the conditional and unconditional passes are "
-                "identical, so the hinge is a constant with no gradient. Filter "
-                "text-only samples out of the dataset, or use a different --loss_type."
-            )
-        for key in visual_keys:
-            inputs_uncond[key] = torch.zeros_like(inputs_uncond[key])
-
-        if batch_size == 1:
-            # Both passes keep their labels, so Liger's fused CE stays active and
-            # no logits are materialised on either side.
-            with torch.no_grad():
-                loss_uncond = model(**inputs_uncond).loss.float()
-            outputs_cond = model(**inputs)
-            loss_cond = outputs_cond.loss.float()
-            loss = torch.clamp(margin - loss_uncond.detach() + loss_cond, min=0.0)
-
-            self._record_cfg(
-                cfg_loss_cond=loss_cond.detach(),
-                cfg_loss_uncond=loss_uncond.detach(),
-                cfg_margin_active=(loss > 0).float().detach(),
-            )
-            return (loss, outputs_cond) if return_outputs else loss
-
-        # batch_size > 1. Labels must be popped from BOTH dicts: with
-        # use_liger_kernel=True (the default) the fused path returns logits=None
-        # whenever labels are present, so reading `outputs.logits` on the
-        # unconditional pass raised `TypeError: 'NoneType' is not subscriptable`
-        # for every batch_size > 1 run.
+        inputs_uncond = self._cfg_uncond_inputs(inputs)
         labels = inputs.pop("labels")
         inputs_uncond.pop("labels", None)
 
         with torch.no_grad():
-            logits_uncond = model(**inputs_uncond).logits
-            uncond_stats = [
-                self._cfg_token_stats(logits_uncond[i], labels[i])
-                for i in range(batch_size)
-            ]
-            per_sample_uncond = torch.stack(
-                [s[0] / s[1].clamp(min=1.0) for s in uncond_stats]
+            per_sample_uncond, _ = self._cfg_per_sample_ce(
+                model, inputs_uncond, labels, batch_size
             )
 
-        outputs_cond = model(**inputs)
-        logits_cond = outputs_cond.logits
-        cond_stats = [self._cfg_token_stats(logits_cond[i], labels[i]) for i in range(batch_size)]
-        per_sample_cond = torch.stack([s[0] / s[1].clamp(min=1.0) for s in cond_stats])
+        per_sample_cond, outputs = self._cfg_per_sample_ce(
+            model, inputs, labels, batch_size
+        )
 
-        loss = torch.clamp(
-            margin - per_sample_uncond.detach() + per_sample_cond, min=0.0
+        slack = margin - per_sample_uncond.detach() + per_sample_cond
+        loss = torch.clamp(slack, min=0.0).mean()
+
+        self._record_cfg(
+            cfg_loss_cond=per_sample_cond.mean().detach(),
+            cfg_loss_uncond=per_sample_uncond.mean().detach(),
+            cfg_margin_active=(slack > 0).float().mean().detach(),
+        )
+        return (loss, outputs) if return_outputs else loss
+
+    def compute_cfg_conf_reg_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Capped dual loss plus an entropy bonus on the unconditional branch.
+
+        ``CE_cond - w * min(CE_uncond, cap) - reg * H_uncond``. The entropy term
+        is *subtracted*, so minimising the loss maximises the entropy of the
+        model's predictions when the image is withheld: the model is asked to fail
+        by being uncertain rather than confidently wrong.
+
+        Unlike the other two objectives the unconditional pass here carries
+        gradient, because the entropy bonus is a statement about the
+        unconditional distribution and cannot shape it from behind a ``detach()``.
+        The CE half of that same pass is still detached and capped, so the
+        unbounded-descent path stays closed.
+        """
+        weight = self.args.cfg_loss_weight
+        reg_weight = self.args.cfg_reg_weight
+        cap = self.args.cfg_uncond_cap
+        batch_size = inputs["input_ids"].size(0)
+
+        inputs_uncond = self._cfg_uncond_inputs(inputs)
+        labels = inputs.pop("labels")
+        inputs_uncond.pop("labels", None)
+
+        outputs_uncond = model(**inputs_uncond)
+        uncond_stats = [
+            self._cfg_token_stats(outputs_uncond.logits[i], labels[i], want_entropy=True)
+            for i in range(batch_size)
+        ]
+        per_sample_uncond = torch.stack(
+            [s[0] / s[1].clamp(min=1.0) for s in uncond_stats]
+        )
+        per_sample_entropy = torch.stack(
+            [s[2] / s[1].clamp(min=1.0) for s in uncond_stats]
+        )
+
+        per_sample_cond, outputs = self._cfg_per_sample_ce(
+            model, inputs, labels, batch_size
+        )
+
+        capped_uncond = per_sample_uncond.detach().clamp(max=cap)
+        loss = (
+            per_sample_cond
+            - weight * capped_uncond
+            - reg_weight * per_sample_entropy
         ).mean()
 
         self._record_cfg(
             cfg_loss_cond=per_sample_cond.mean().detach(),
             cfg_loss_uncond=per_sample_uncond.mean().detach(),
-            cfg_margin_active=(
-                margin - per_sample_uncond + per_sample_cond > 0
-            ).float().mean().detach(),
-        )
-        return (loss, outputs_cond) if return_outputs else loss
-
-    def compute_cfg_conf_reg_loss(self, model, inputs, is_dropped, return_outputs=False,
-                                  num_items_in_batch=None, **kwargs):
-        """CFG dual loss plus an entropy bonus on the unconditional predictions.
-
-        ``L_cond - w * L_uncond - reg * H_uncond``: the entropy term is
-        *subtracted*, so minimising the loss maximises the entropy of the
-        model's predictions when the image is withheld.
-        """
-        weight = self.args.cfg_loss_weight
-        drop_prob = self.args.cfg_drop_prob
-        reg_weight = self.args.cfg_reg_weight
-        batch_size = is_dropped.size(0)
-
-        # Labels are popped unconditionally. The entropy term needs the full
-        # distribution, so there is no fused-CE shortcut to preserve here, and
-        # popping on every rank keeps the forward graph identical across the
-        # process group (a data-dependent forward branch would deadlock ZeRO-3).
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
-
-        dropped = is_dropped.tolist()
-        stats = [
-            # Entropy is only needed for the unconditional rows. Computing it for
-            # every sample and discarding it, as the first version did, paid for
-            # the largest allocation in this function twice over. Branching here
-            # is safe: this is elementwise maths on already-gathered logits, not
-            # a module forward, so it cannot desynchronise collectives.
-            self._cfg_token_stats(logits[i], labels[i], want_entropy=dropped[i])
-            for i in range(batch_size)
-        ]
-        loss_sums = torch.stack([s[0] for s in stats])
-        tok_counts = torch.stack([s[1] for s in stats])
-        entropy_sums = torch.stack([s[2] for s in stats])
-
-        cond_mask = ~is_dropped
-        sum_cond = (loss_sums * cond_mask).sum()
-        sum_uncond = (loss_sums * is_dropped).sum()
-        sum_entropy = (entropy_sums * is_dropped).sum()
-        denom = self._cfg_denominator(num_items_in_batch, tok_counts.sum())
-
-        # Same token-share weighting as compute_cfg_loss; see the comment there
-        # for why dividing group means by (1-p)/p double-corrects.
-        loss = (
-            sum_cond / (denom * (1.0 - drop_prob))
-            - weight * sum_uncond / (denom * drop_prob)
-            - reg_weight * sum_entropy / (denom * drop_prob)
-        )
-
-        tok_cond = (tok_counts * cond_mask).sum().clamp(min=1.0)
-        tok_uncond = (tok_counts * is_dropped).sum().clamp(min=1.0)
-        self._record_cfg(
-            cfg_loss_cond=(sum_cond / tok_cond).detach(),
-            cfg_loss_uncond=(sum_uncond / tok_uncond).detach(),
-            cfg_entropy_uncond=(sum_entropy / tok_uncond).detach(),
-            cfg_frac_dropped=is_dropped.float().mean().detach(),
+            cfg_entropy_uncond=per_sample_entropy.mean().detach(),
+            cfg_uncond_capped=(per_sample_uncond > cap).float().mean().detach(),
         )
         return (loss, outputs) if return_outputs else loss
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Dispatch to the configured CFG objective, or fall back to plain SFT."""
-        # Pop the custom key -- model.forward() does not expect it.
-        is_dropped = inputs.pop("is_image_dropped", None)
-
         loss_type = getattr(self.args, "loss_type", "standard")
 
-        # `cfg_margin` derives its own unconditional pass and never reads
-        # `is_dropped`; the other CFG losses cannot run without it.
-        needs_flag = loss_type in ("cfg", "cfg_conf_reg")
-        if loss_type == "standard" or (needs_flag and is_dropped is None):
+        if loss_type == "standard":
             return super(QwenSFTTrainer, self).compute_loss(
                 model, inputs, return_outputs=return_outputs, **kwargs
             )
         if loss_type == "cfg":
             return self.compute_cfg_loss(
-                model, inputs, is_dropped, return_outputs=return_outputs, **kwargs
+                model, inputs, return_outputs=return_outputs, **kwargs
             )
         if loss_type == "cfg_margin":
             return self.compute_cfg_margin_loss(
@@ -406,7 +334,7 @@ class QwenSFTTrainer(Trainer):
             )
         if loss_type == "cfg_conf_reg":
             return self.compute_cfg_conf_reg_loss(
-                model, inputs, is_dropped, return_outputs=return_outputs, **kwargs
+                model, inputs, return_outputs=return_outputs, **kwargs
             )
         raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
@@ -535,7 +463,6 @@ class QwenSFTTrainer(Trainer):
             self.model.base_model.config.to_json_file(os.path.join(output_dir, "config.json"))
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        inputs.pop("is_image_dropped", None)  # Remove custom key before model forward
         labels = inputs.get("labels") if "labels" in inputs else None
 
         with torch.no_grad():
@@ -710,8 +637,7 @@ class QwenSFTTrainer(Trainer):
         for step, inputs in enumerate(dataloader):
             # Move inputs to device
             inputs = self._prepare_inputs(inputs)
-            inputs.pop("is_image_dropped", None)  # Remove custom key before model forward
-
+    
             batch_input_ids = inputs["input_ids"]
             batch_labels = inputs["labels"]
             batch_size = batch_input_ids.shape[0]

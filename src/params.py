@@ -161,8 +161,23 @@ class TrainingArguments(HFTrainingArguments):
         metadata={"help": "Weight for the unconditional (negative) loss in CFG training. 0 = disabled."},
     )
     cfg_loss_margin: float = field(
-        default=1.0,
-        metadata={"help": "Margin for the CFG margin loss. Used when loss_type is 'cfg_margin'."},
+        default=0.2,
+        metadata={
+            "help": "Margin for the CFG margin loss, in nats of per-token cross-entropy. "
+                    "Used when loss_type is 'cfg_margin'. Should be on the scale of the "
+                    "actual CE gap between the conditional and unconditional branches "
+                    "(order 0.1-0.3); a margin far above that gap leaves the hinge active "
+                    "on every sample, which defeats the point of having one."
+        },
+    )
+    cfg_uncond_cap: float = field(
+        default=5.0,
+        metadata={
+            "help": "Upper clamp on the unconditional cross-entropy, in nats, for the "
+                    "'cfg' and 'cfg_conf_reg' losses. Without it the -w*CE_uncond term is "
+                    "unbounded below and training is paid to make the model arbitrarily "
+                    "bad when the image is withheld."
+        },
     )
     cfg_reg_weight: float = field(
         default=0.0,
@@ -328,8 +343,4 @@ class DataArguments:
     enable_reasoning: bool = field(
         default=False,
         metadata={"help": "Enable reasoning-field parsing and model-specific <think> prompt formatting when supported."},
-    )
-    cfg_drop_prob: float = field(
-        default=0.0,
-        metadata={"help": "Probability of dropping image (replacing pixel values with zeros) for CFG training. 0 = disabled."},
     )
